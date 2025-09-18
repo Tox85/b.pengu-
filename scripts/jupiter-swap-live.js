@@ -1,19 +1,21 @@
 #!/usr/bin/env node
 
-const dotenv = require('dotenv');
+require('dotenv').config({ override: true });
+const TARGET_ASSET = (process.env.TARGET_ASSET || 'PENGU').toUpperCase(); // default PENGU
+const SYMBOL = TARGET_ASSET; // log-friendly
+
+console.log(`🪄 Jupiter LIVE — USDC → ${SYMBOL} (${process.env.DRY_RUN==='true'?'DRY RUN':'LIVE'})`);
+
 const { Connection, Keypair, PublicKey, Transaction, VersionedTransaction, TransactionMessage, ComputeBudgetProgram, SystemProgram, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, getAccount, createSyncNativeInstruction, getMint, TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const fs = require('fs');
 const axios = require('axios');
 
-console.log('🔄 Jupiter Swap LIVE USDC → WSOL...');
-
-dotenv.config();
-
 // Parse command line arguments
 const args = process.argv.slice(2);
 const usdcAmount = args.find(arg => arg.startsWith('--usdc='))?.split('=')[1];
 const wrapSol = args.find(arg => arg.startsWith('--wrap='))?.split('=')[1] !== 'false';
+const dryRun = args.includes('--dry-run') || process.env.DRY_RUN === 'true';
 
 async function jupiterSwapLive() {
   const startTime = Date.now();
@@ -24,7 +26,7 @@ async function jupiterSwapLive() {
   
   try {
     console.log('⚠️ ATTENTION: Mode LIVE activé !');
-    console.log('   Swap: USDC → WSOL');
+    console.log(`   Swap: USDC → ${SYMBOL}`);
     console.log('   Montant: 0.4-0.5 USDC');
     console.log('   Sécurité: Caps activés');
     
@@ -60,8 +62,8 @@ async function jupiterSwapLive() {
       throw new Error('SOL insuffisant pour les frais de transaction');
     }
     
-    if (usdcBalanceBefore < 0.01e6) {
-      throw new Error('USDC insuffisant pour le swap (minimum 0.01 USDC)');
+    if (usdcBalanceBefore < 0.0005e6) {
+      throw new Error('USDC insuffisant pour le swap (minimum 0.0005 USDC)');
     }
     
     // 3. Configuration Jupiter
@@ -71,8 +73,7 @@ async function jupiterSwapLive() {
     });
     
     const inputMint = new PublicKey(process.env.SOL_USDC_MINT);
-    const targetAsset = process.env.TARGET_ASSET || 'WSOL';
-    const outputMint = targetAsset === 'PENGU' 
+    const outputMint = TARGET_ASSET === 'PENGU' 
       ? new PublicKey(process.env.SOL_PENGU_MINT)
       : new PublicKey(process.env.SOL_WSOL_MINT);
     
@@ -86,7 +87,7 @@ async function jupiterSwapLive() {
     }
     
     console.log(`   Input Mint: ${inputMint.toBase58()}`);
-    console.log(`   Target Asset: ${targetAsset}`);
+    console.log(`   Target Asset: ${TARGET_ASSET}`);
     console.log(`   Output Mint: ${outputMint.toBase58()}`);
     console.log(`   Swap Amount: ${swapAmount / 1e6} USDC`);
     
@@ -103,20 +104,20 @@ async function jupiterSwapLive() {
           inputMint: inputMint.toBase58(),
           outputMint: outputMint.toBase58(),
           amount: swapAmount.toString(),
-          slippageBps: 50, // 0.5%
+          slippageBps: parseInt(process.env.SLIPPAGE_BPS || '50'),
           swapMode: 'ExactIn'
         }
       });
       
       quote = quoteResponse.data;
       console.log('✅ Quote Jupiter direct récupéré');
-      console.log(`   Route: USDC → ${targetAsset}`);
+      console.log(`   Route: USDC → ${TARGET_ASSET}`);
       console.log(`   Input Amount: ${quote.inAmount}`);
       console.log(`   Output Amount: ${quote.outAmount}`);
       console.log(`   Price Impact: ${quote.priceImpactPct}%`);
       
     } catch (error) {
-      if (targetAsset === 'PENGU') {
+      if (TARGET_ASSET === 'PENGU') {
         console.log('   Route directe USDC → PENGU échouée, essai multi-hop...');
         
         try {
@@ -130,7 +131,7 @@ async function jupiterSwapLive() {
               inputMint: inputMint.toBase58(),
               outputMint: wsolMint.toBase58(),
               amount: swapAmount.toString(),
-              slippageBps: 50,
+              slippageBps: parseInt(process.env.SLIPPAGE_BPS || '50'),
               swapMode: 'ExactIn'
             }
           });
@@ -144,7 +145,7 @@ async function jupiterSwapLive() {
               inputMint: wsolMint.toBase58(),
               outputMint: penguMint.toBase58(),
               amount: usdcToWsolQuote.outAmount,
-              slippageBps: 50,
+              slippageBps: parseInt(process.env.SLIPPAGE_BPS || '50'),
               swapMode: 'ExactIn'
             }
           });
@@ -175,7 +176,7 @@ async function jupiterSwapLive() {
               inputMint: inputMint.toBase58(),
               outputMint: wsolMint.toBase58(),
               amount: swapAmount.toString(),
-              slippageBps: 50,
+              slippageBps: parseInt(process.env.SLIPPAGE_BPS || '50'),
               swapMode: 'ExactIn'
             }
           });
@@ -245,41 +246,51 @@ async function jupiterSwapLive() {
     // 6. Construire et envoyer la transaction de swap
     console.log('\n6️⃣ Construction de la transaction de swap...');
     
-    const swapResponse = await jupiterApi.post('/swap', {
-      quoteResponse: quote,
-      userPublicKey: keypair.publicKey.toBase58(),
-      wrapAndUnwrapSol: wrapSol, // Contrôlé par paramètre
-      prioritizationFeeLamports: parseInt(process.env.SOL_MICRO_LAMPORTS || '1000'),
-      dynamicComputeUnitLimit: true,
-      skipUserAccountsRpcCalls: true,
-    });
-    
-    const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
-    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-    
-    console.log('   Transaction Jupiter récupérée');
-    console.log(`   Compute Units: ${process.env.SOL_COMPUTE_UNITS || '200000'}`);
-    console.log(`   Priority Fee: ${process.env.SOL_MICRO_LAMPORTS || '1000'} microLamports`);
-    
-    // 7. Signer et envoyer la transaction
-    console.log('\n7️⃣ Signature et envoi de la transaction de swap...');
-    
-    // Signer la transaction
-    transaction.sign([keypair]);
-    console.log('   Transaction signée');
-    
-    // Envoyer la transaction
-    swapTxHash = await solanaConnection.sendTransaction(transaction, {
-      skipPreflight: false,
-      maxRetries: 5,
-    });
-    
-    console.log(`   Swap Tx envoyée: ${swapTxHash}`);
-    
-    // Attendre la confirmation
-    console.log('   Attente de la confirmation...');
-    await solanaConnection.confirmTransaction(swapTxHash, 'confirmed');
-    console.log(`   Swap Tx confirmée: ${swapTxHash}`);
+    if (dryRun) {
+      console.log('🔍 DRY RUN: Simulation du swap...');
+      console.log(`   Route: USDC → ${TARGET_ASSET}`);
+      console.log(`   Input Amount: ${quote.inAmount}`);
+      console.log(`   Output Amount: ${quote.outAmount}`);
+      console.log(`   Price Impact: ${quote.priceImpactPct}%`);
+      console.log(`   Slippage: ${process.env.SLIPPAGE_BPS || '50'} bps`);
+      swapTxHash = 'DRY_RUN_SWAP_TX_HASH';
+    } else {
+      const swapResponse = await jupiterApi.post('/swap', {
+        quoteResponse: quote,
+        userPublicKey: keypair.publicKey.toBase58(),
+        wrapAndUnwrapSol: wrapSol, // Contrôlé par paramètre
+        prioritizationFeeLamports: parseInt(process.env.SOL_MICRO_LAMPORTS || '1000'),
+        dynamicComputeUnitLimit: true,
+        skipUserAccountsRpcCalls: true,
+      });
+      
+      const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, 'base64');
+      const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+      
+      console.log('   Transaction Jupiter récupérée');
+      console.log(`   Compute Units: ${process.env.SOL_COMPUTE_UNITS || '200000'}`);
+      console.log(`   Priority Fee: ${process.env.SOL_MICRO_LAMPORTS || '1000'} microLamports`);
+      
+      // 7. Signer et envoyer la transaction
+      console.log('\n7️⃣ Signature et envoi de la transaction de swap...');
+      
+      // Signer la transaction
+      transaction.sign([keypair]);
+      console.log('   Transaction signée');
+      
+      // Envoyer la transaction
+      swapTxHash = await solanaConnection.sendTransaction(transaction, {
+        skipPreflight: false,
+        maxRetries: 5,
+      });
+      
+      console.log(`   Swap Tx envoyée: ${swapTxHash}`);
+      
+      // Attendre la confirmation
+      console.log('   Attente de la confirmation...');
+      await solanaConnection.confirmTransaction(swapTxHash, 'confirmed');
+      console.log(`   Swap Tx confirmée: ${swapTxHash}`);
+    }
     
     // 8. Vérification des balances APRÈS
     console.log('\n8️⃣ Vérification des balances APRÈS...');
@@ -303,7 +314,7 @@ async function jupiterSwapLive() {
     
     console.log(`   SOL: ${solBalanceAfter / 1e9} (${(solBalanceAfter - solBalanceBefore) / 1e9} gagné)`);
     console.log(`   USDC: ${usdcBalanceAfter / 1e6} (${(usdcBalanceAfter - usdcBalanceBefore) / 1e6} perdu)`);
-    console.log(`   WSOL: ${wsolBalanceAfter / 1e9} (${wsolBalanceAfter / 1e9} gagné)`);
+    console.log(`   ${TARGET_ASSET}: ${wsolBalanceAfter / (TARGET_ASSET === 'PENGU' ? 1e6 : 1e9)} (${wsolBalanceAfter / (TARGET_ASSET === 'PENGU' ? 1e6 : 1e9)} gagné)`);
     
     // 9. Fallback wrap SOL→WSOL si nécessaire
     if (wsolBalanceAfter === 0 && solBalanceAfter > 0.002e9) {
@@ -374,7 +385,7 @@ async function jupiterSwapLive() {
     // 10. Critères de succès
     console.log('\n🔟 Critères de succès...');
     console.log('✅ Transaction de swap confirmée');
-    console.log('✅ USDC converti en WSOL');
+    console.log(`✅ USDC converti en ${TARGET_ASSET}`);
     console.log('✅ Configuration valide');
     console.log('✅ Fonds disponibles');
     
@@ -391,11 +402,12 @@ async function jupiterSwapLive() {
     console.log(`   Erreur: ${error ? error.message : 'Aucune'}`);
     console.log(`   Swap Tx Hash: ${swapTxHash || 'N/A'}`);
     console.log(`   From Token: USDC`);
-    console.log(`   To Token: WSOL`);
+    console.log(`   To Token: ${TARGET_ASSET}`);
     console.log(`   Address: ${keypair?.publicKey?.toString() || 'N/A'}`);
     
     if (success) {
-      console.log('\n🎉 Swap Jupiter LIVE réussi !');
+      console.log(`\n🎉 Swap Jupiter LIVE réussi !`);
+      console.log(`   USDC → ${TARGET_ASSET} confirmé`);
       console.log('   Prochaine étape: Orca LP');
     } else {
       console.log('\n💥 Swap Jupiter LIVE échoué !');
